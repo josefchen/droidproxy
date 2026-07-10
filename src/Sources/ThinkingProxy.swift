@@ -959,13 +959,18 @@ class ThinkingProxy {
     }
 
     /// Max bytes to buffer while looking for an early Responses SSE error.
-    private static let responsesPeekMaxBytes = 65_536
+    ///
+    /// Must exceed a typical Droid `response.created` + `response.in_progress`
+    /// pair: those events embed the full tools array and routinely exceed 64KB
+    /// before Codex emits `event: error` (e.g. `context_too_large`). Flushing
+    /// early left Droid with HTTP 200 + ignored SSE error → "no usable output".
+    private static let responsesPeekMaxBytes = 1_048_576
 
     /**
      Buffers the start of a Responses API stream. If Codex/OpenAI emits
-     `event: error` (commonly `context_too_large`) before any usable content,
-     convert that into a JSON 400 for the client. Otherwise flush the buffer and
-     continue transparent streaming.
+     `event: error` / `response.failed` (commonly `context_too_large`) before any
+     usable content, convert that into a JSON 400 for the client. Otherwise flush
+     the buffer and continue transparent streaming.
      */
     private func peekResponsesStream(from targetConnection: NWConnection,
                                      to originalConnection: NWConnection,
@@ -990,6 +995,7 @@ class ThinkingProxy {
                 if isComplete {
                     self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: true)
                 } else if buffer.count >= Self.responsesPeekMaxBytes {
+                    ThinkingProxy.fileLog("RESPONSES PEEK: flushing headers-only buffer at \(buffer.count) bytes")
                     self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: false)
                 } else {
                     self.peekResponsesStream(from: targetConnection, to: originalConnection, accumulated: buffer)
@@ -1016,8 +1022,26 @@ class ThinkingProxy {
                 return
             }
 
-            if isComplete || buffer.count >= Self.responsesPeekMaxBytes {
-                self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: isComplete)
+            if isComplete {
+                // Stream ended with only preamble (created/in_progress) and no
+                // usable deltas — Droid would report "no usable output".
+                if bodyText.contains("response.created") || bodyText.contains("response.in_progress") {
+                    let message = "Upstream Responses stream completed without usable output"
+                    NSLog("[ThinkingProxy] Responses SSE empty completion")
+                    ThinkingProxy.fileLog("RESPONSES EMPTY COMPLETION")
+                    self.sendJSONError(to: originalConnection,
+                                       statusCode: 400,
+                                       code: "empty_response",
+                                       message: message)
+                    return
+                }
+                self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: true)
+                return
+            }
+
+            if buffer.count >= Self.responsesPeekMaxBytes {
+                ThinkingProxy.fileLog("RESPONSES PEEK: flushing at \(buffer.count) bytes without early error")
+                self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: false)
                 return
             }
 
@@ -1054,10 +1078,13 @@ class ThinkingProxy {
         }))
     }
 
-    /// True when the SSE body already contains text/tool/reasoning output Droid can use.
+    /// True when the SSE body already contains text/tool/reasoning deltas Droid can use.
+    ///
+    /// Deliberately excludes `response.output_item.added` — that fires for empty
+    /// message shells before a later `event: error`, and treating it as usable
+    /// caused the peek to flush too early.
     static func responsesSSEHasUsableContent(in body: String) -> Bool {
         let markers = [
-            "response.output_item.added",
             "response.output_text.delta",
             "response.function_call_arguments.delta",
             "response.custom_tool_call_input.delta",
@@ -1066,7 +1093,7 @@ class ThinkingProxy {
         return markers.contains { body.contains($0) }
     }
 
-    /// Parses an early Responses SSE `error` event (before usable content).
+    /// Parses an early Responses SSE `error` / `response.failed` event (before usable content).
     static func parseEarlyResponsesSSEError(in body: String) -> (code: String, message: String)? {
         var eventName = ""
         for rawLine in body.components(separatedBy: "\n") {
@@ -1077,7 +1104,10 @@ class ThinkingProxy {
             }
             if line.hasPrefix("data:") {
                 let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                let isErrorEvent = eventName == "error" || payload.contains("\"type\":\"error\"")
+                let isErrorEvent = eventName == "error"
+                    || eventName == "response.failed"
+                    || payload.contains("\"type\":\"error\"")
+                    || payload.contains("\"type\":\"response.failed\"")
                 if isErrorEvent, let parsed = parseResponsesErrorPayload(payload) {
                     return parsed
                 }
@@ -1096,11 +1126,28 @@ class ThinkingProxy {
             return nil
         }
         let type = object["type"] as? String
-        guard type == nil || type == "error" else { return nil }
-        let message = (object["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !message.isEmpty else { return nil }
-        let code = (object["code"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (code?.isEmpty == false ? code! : "upstream_error", message)
+
+        // Top-level SSE error event: {"type":"error","code":"...","message":"..."}
+        if type == nil || type == "error" {
+            let message = (object["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !message.isEmpty {
+                let code = (object["code"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                return (code?.isEmpty == false ? code! : "upstream_error", message)
+            }
+        }
+
+        // response.failed embeds error under response.error
+        if type == "response.failed",
+           let response = object["response"] as? [String: Any],
+           let nested = response["error"] as? [String: Any] {
+            let message = (nested["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !message.isEmpty {
+                let code = (nested["code"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                return (code?.isEmpty == false ? code! : "upstream_error", message)
+            }
+        }
+
+        return nil
     }
     
     /**

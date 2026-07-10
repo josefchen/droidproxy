@@ -20,6 +20,9 @@ struct DroidProxyModelDefinition: Equatable {
     let idSlug: String
     let displayName: String
     let maxOutputTokens: Int
+    /// Optional Factory `maxContextLimit` (accepted by customModels schema).
+    /// Compaction still primarily uses root `compactionTokenLimitPerModel`.
+    let maxContextLimit: Int?
     let provider: String
     let providerKey: String
     let baseURL: String
@@ -31,6 +34,7 @@ struct DroidProxyModelDefinition: Equatable {
          idSlug: String,
          displayName: String,
          maxOutputTokens: Int,
+         maxContextLimit: Int? = nil,
          provider: String,
          providerKey: String,
          baseURL: String,
@@ -41,6 +45,7 @@ struct DroidProxyModelDefinition: Equatable {
         self.idSlug = idSlug
         self.displayName = displayName
         self.maxOutputTokens = maxOutputTokens
+        self.maxContextLimit = maxContextLimit
         self.provider = provider
         self.providerKey = providerKey
         self.baseURL = baseURL
@@ -77,6 +82,9 @@ struct DroidProxyModelDefinition: Equatable {
             "noImageSupport": false,
             "provider": provider
         ]
+        if let maxContextLimit {
+            entry["maxContextLimit"] = maxContextLimit
+        }
         guard !levels.isEmpty else { return entry }
         entry["enableThinking"] = true
         entry["supportedReasoningEfforts"] = levels.map(\.value)
@@ -166,6 +174,7 @@ enum DroidProxyModelCatalog {
                 idSlug: "gpt-5.4",
                 displayName: "GPT 5.4",
                 maxOutputTokens: 128000,
+                maxContextLimit: 272_000,
                 provider: "openai",
                 providerKey: "codex",
                 baseURL: "http://localhost:8317/v1",
@@ -178,6 +187,7 @@ enum DroidProxyModelCatalog {
                 idSlug: "gpt-5.5",
                 displayName: "GPT 5.5",
                 maxOutputTokens: 128000,
+                maxContextLimit: 272_000,
                 provider: "openai",
                 providerKey: "codex",
                 baseURL: "http://localhost:8317/v1",
@@ -190,6 +200,7 @@ enum DroidProxyModelCatalog {
                 idSlug: "gpt-5.6-terra",
                 displayName: "GPT 5.6 Terra",
                 maxOutputTokens: 128000,
+                maxContextLimit: 372_000,
                 provider: "openai",
                 providerKey: "codex",
                 baseURL: "http://localhost:8317/v1",
@@ -202,6 +213,7 @@ enum DroidProxyModelCatalog {
                 idSlug: "gpt-5.6-sol",
                 displayName: "GPT 5.6 Sol",
                 maxOutputTokens: 128000,
+                maxContextLimit: 372_000,
                 provider: "openai",
                 providerKey: "codex",
                 baseURL: "http://localhost:8317/v1",
@@ -408,17 +420,17 @@ enum DroidProxyModelCatalog {
 
     /// Factory root-level `compactionTokenLimitPerModel` entries for Codex OAuth models.
     ///
-    /// BYOK `customModels` has no context-window field (only `maxOutputTokens`). Droid's
-    /// auto-compaction is driven by top-level `compactionTokenLimit` /
-    /// `compactionTokenLimitPerModel` instead. ChatGPT/Codex OAuth windows are smaller
-    /// than the public API windows (Sol/Terra API = 1.05M; Codex catalog = 372k), so
-    /// these thresholds sit under the Codex effective window (~95% of catalog).
+    /// Custom models also accept `maxContextLimit`, but Droid's auto-compaction is
+    /// driven by top-level `compactionTokenLimit` / `compactionTokenLimitPerModel`
+    /// (custom BYOK ids resolve to infinite maxInputTokens otherwise). ChatGPT/Codex
+    /// OAuth windows are smaller than the public API windows (Sol/Terra API = 1.05M;
+    /// Codex catalog = 372k), so these thresholds sit under the Codex effective window.
     static var factoryCompactionTokenLimitPerModel: [String: Int] {
         [
-            // Codex catalog: 372000 → effective ~353400
+            // Codex catalog: 372000 → compact well under the OAuth window
             "custom:droidproxy:gpt-5.6-sol": 300_000,
             "custom:droidproxy:gpt-5.6-terra": 300_000,
-            // Codex catalog: 272000 → effective ~258400
+            // Codex catalog: 272000
             "custom:droidproxy:gpt-5.5": 220_000,
             "custom:droidproxy:gpt-5.4": 220_000
         ]
