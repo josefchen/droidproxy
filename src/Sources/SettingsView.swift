@@ -1331,6 +1331,7 @@ struct SettingsView: View {
         }
 
         settings["customModels"] = models
+        mergeFactoryCompactionTokenLimits(&settings)
 
         do {
             backupFactorySettingsIfPresent(url)
@@ -1342,7 +1343,7 @@ struct SettingsView: View {
             }
             try data.write(to: url, options: .atomic)
             factoryModelsInstalled = true
-            authResultMessage = "DroidProxy models merged into Factory settings.\n\nYour other custom models were kept. Only previous DroidProxy entries were replaced. A timestamped backup was saved next to settings.json.\n\nIn Droid CLI use /model and search for “DroidProxy:” (e.g. DroidProxy: Grok 4.5, DroidProxy: GPT 5.5). Restart Factory or open a new session if the picker looks stale. Reasoning effort is controlled from Droid per session when the model exposes multiple levels."
+            authResultMessage = "DroidProxy models merged into Factory settings.\n\nYour other custom models were kept. Only previous DroidProxy entries were replaced. Codex compaction limits for Sol/Terra/5.5/5.4 were written to compactionTokenLimitPerModel. A timestamped backup was saved next to settings.json.\n\nIn Droid CLI use /model and search for “DroidProxy:” (e.g. DroidProxy: Grok 4.5, DroidProxy: GPT 5.5). Restart Factory or open a new session if the picker looks stale. Reasoning effort is controlled from Droid per session when the model exposes multiple levels. Oversized sessions: run /compress (or /context to inspect usage)."
             showingAuthResult = true
             NSLog("[SettingsView] Factory custom models applied to %@", url.path)
         } catch {
@@ -1375,6 +1376,21 @@ struct SettingsView: View {
         DroidProxyModelCatalog.settingsModels { providerKey in
             guard let serviceType = ServiceType(authFileType: providerKey) else { return true }
             return serverManager.isProviderEnabled(serviceType)
+        }
+    }
+
+    /// Merge Codex OAuth compaction thresholds into Factory's root-level
+    /// `compactionTokenLimitPerModel`. BYOK customModels cannot declare a context
+    /// window; this is the documented Droid setting that triggers auto-compaction.
+    private func mergeFactoryCompactionTokenLimits(_ settings: inout [String: Any]) {
+        var perModel = (settings["compactionTokenLimitPerModel"] as? [String: Any]) ?? [:]
+        for (modelID, limit) in DroidProxyModelCatalog.factoryCompactionTokenLimitPerModel {
+            perModel[modelID] = limit
+        }
+        settings["compactionTokenLimitPerModel"] = perModel
+        // Prefer the active session model for BYOK compaction (avoids Factory-backend billing).
+        if settings["compactionModelMode"] == nil {
+            settings["compactionModelMode"] = "same"
         }
     }
 

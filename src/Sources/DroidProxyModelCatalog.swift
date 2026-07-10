@@ -405,4 +405,22 @@ enum DroidProxyModelCatalog {
     static var allSettingsIDs: Set<String> {
         Set(definitions.map(\.simpleID))
     }
+
+    /// Factory root-level `compactionTokenLimitPerModel` entries for Codex OAuth models.
+    ///
+    /// BYOK `customModels` has no context-window field (only `maxOutputTokens`). Droid's
+    /// auto-compaction is driven by top-level `compactionTokenLimit` /
+    /// `compactionTokenLimitPerModel` instead. ChatGPT/Codex OAuth windows are smaller
+    /// than the public API windows (Sol/Terra API = 1.05M; Codex catalog = 372k), so
+    /// these thresholds sit under the Codex effective window (~95% of catalog).
+    static var factoryCompactionTokenLimitPerModel: [String: Int] {
+        [
+            // Codex catalog: 372000 → effective ~353400
+            "custom:droidproxy:gpt-5.6-sol": 300_000,
+            "custom:droidproxy:gpt-5.6-terra": 300_000,
+            // Codex catalog: 272000 → effective ~258400
+            "custom:droidproxy:gpt-5.5": 220_000,
+            "custom:droidproxy:gpt-5.4": 220_000
+        ]
+    }
 }
