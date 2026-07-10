@@ -332,6 +332,8 @@ struct SettingsView: View {
     @State private var launchAtLogin = false
     @AppStorage(AppPreferences.gpt54FastModeKey) private var gpt54FastMode = AppPreferences.defaultGpt54FastMode
     @AppStorage(AppPreferences.gpt55FastModeKey) private var gpt55FastMode = AppPreferences.defaultGpt55FastMode
+    @AppStorage(AppPreferences.gpt56TerraFastModeKey) private var gpt56TerraFastMode = AppPreferences.defaultGpt56TerraFastMode
+    @AppStorage(AppPreferences.gpt56SolFastModeKey) private var gpt56SolFastMode = AppPreferences.defaultGpt56SolFastMode
     @AppStorage(AppPreferences.allowRemoteKey) private var allowRemote = AppPreferences.defaultAllowRemote
     @AppStorage(AppPreferences.secretKeyKey) private var secretKey = AppPreferences.defaultSecretKey
     @AppStorage(AppPreferences.bindAddressKey) private var bindAddress = AppPreferences.defaultBindAddress
@@ -626,7 +628,7 @@ struct SettingsView: View {
                             .controlSize(.small)
                         }
 
-                        Text("Apply writes DroidProxy model aliases into ~/.factory/settings.json and makes a timestamped backup first. Reasoning effort is selected from Droid CLI when the model exposes multiple levels.")
+                        Text("Apply merges DroidProxy aliases into ~/.factory/settings.json (keeps your OpenRouter/Z.AI/other custom models; only replaces prior DroidProxy entries). A timestamped backup is written first. Look for names like “DroidProxy: Grok 4.5” in Droid’s /model picker after restarting Factory or opening a new session. Reasoning effort is selected in Droid when the model exposes multiple levels.")
                             .font(.caption2)
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -780,6 +782,16 @@ struct SettingsView: View {
                                     "GPT 5.5",
                                     isOn: $gpt55FastMode,
                                     helpText: "Injects service_tier=priority for GPT 5.5 Responses API requests (Codex fast mode)"
+                                )
+                                codexFastModeToggleRow(
+                                    "GPT 5.6 Terra",
+                                    isOn: $gpt56TerraFastMode,
+                                    helpText: "Injects service_tier=priority for GPT 5.6 Terra Responses API requests (Codex fast mode)"
+                                )
+                                codexFastModeToggleRow(
+                                    "GPT 5.6 Sol",
+                                    isOn: $gpt56SolFastMode,
+                                    helpText: "Injects service_tier=priority for GPT 5.6 Sol Responses API requests (Codex fast mode)"
                                 )
                             }
                         }
@@ -1330,7 +1342,7 @@ struct SettingsView: View {
             }
             try data.write(to: url, options: .atomic)
             factoryModelsInstalled = true
-            authResultMessage = "DroidProxy models added to Factory settings.\n\nA timestamped backup was saved next to settings.json before writing. Reasoning effort is controlled from Droid CLI per session when the selected model exposes multiple levels. Restart Factory or open a new session to see them in the model picker."
+            authResultMessage = "DroidProxy models merged into Factory settings.\n\nYour other custom models were kept. Only previous DroidProxy entries were replaced. A timestamped backup was saved next to settings.json.\n\nIn Droid CLI use /model and search for “DroidProxy:” (e.g. DroidProxy: Grok 4.5, DroidProxy: GPT 5.5). Restart Factory or open a new session if the picker looks stale. Reasoning effort is controlled from Droid per session when the model exposes multiple levels."
             showingAuthResult = true
             NSLog("[SettingsView] Factory custom models applied to %@", url.path)
         } catch {

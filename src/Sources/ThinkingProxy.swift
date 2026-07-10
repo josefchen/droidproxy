@@ -13,6 +13,8 @@ import Network
    GPT 5.x fast-mode models (these toggles are independent of reasoning effort).
  - Rewrites Gemini `/v1/responses` to `/v1/chat/completions` since the backend does not
    support Gemini via the Responses API endpoint.
+ - Translates early Responses API SSE `error` events (e.g. `context_too_large`) into an
+   HTTP 400 JSON error before Droid sees an empty 200 stream as "no usable output".
 
  JSON edits and hot-path inspections are surgical (no full JSON re-serialization) so
  Anthropic prompt-cache key ordering is preserved and large prompts avoid parse overhead.
@@ -856,6 +858,10 @@ class ThinkingProxy {
             guard AppPreferences.gpt54FastMode else { return nil }
         case "gpt-5.5":
             guard AppPreferences.gpt55FastMode else { return nil }
+        case "gpt-5.6-terra":
+            guard AppPreferences.gpt56TerraFastMode else { return nil }
+        case "gpt-5.6-sol":
+            guard AppPreferences.gpt56SolFastMode else { return nil }
         default:
             return nil
         }
@@ -915,7 +921,8 @@ class ThinkingProxy {
                             originalConnection.cancel()
                         } else {
                             self.receiveResponse(from: targetConnection,
-                                                 originalConnection: originalConnection)
+                                                 originalConnection: originalConnection,
+                                                 path: path)
                         }
                     }))
                 }
@@ -933,13 +940,167 @@ class ThinkingProxy {
         targetConnection.start(queue: .global(qos: .userInitiated))
     }
     /**
-     Receives response from CLIProxyAPI
-     Starts the streaming loop for response data
+     Receives response from CLIProxyAPI.
+     For Responses API streams, peeks for early SSE `error` events (context overflow, etc.)
+     and rewrites them to HTTP 400 so Droid surfaces the real message instead of
+     "LLM response contained no usable output".
      */
     private func receiveResponse(from targetConnection: NWConnection,
-                                 originalConnection: NWConnection) {
-        // Start the streaming loop
-        streamNextChunk(from: targetConnection, to: originalConnection)
+                                 originalConnection: NWConnection,
+                                 path: String) {
+        let normalizedPath = path.split(separator: "?").first.map(String.init) ?? path
+        if isResponsesAPIPath(normalizedPath) {
+            peekResponsesStream(from: targetConnection,
+                                to: originalConnection,
+                                accumulated: Data())
+        } else {
+            streamNextChunk(from: targetConnection, to: originalConnection)
+        }
+    }
+
+    /// Max bytes to buffer while looking for an early Responses SSE error.
+    private static let responsesPeekMaxBytes = 65_536
+
+    /**
+     Buffers the start of a Responses API stream. If Codex/OpenAI emits
+     `event: error` (commonly `context_too_large`) before any usable content,
+     convert that into a JSON 400 for the client. Otherwise flush the buffer and
+     continue transparent streaming.
+     */
+    private func peekResponsesStream(from targetConnection: NWConnection,
+                                     to originalConnection: NWConnection,
+                                     accumulated: Data) {
+        targetConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            if let error = error {
+                NSLog("[ThinkingProxy] Receive response error during peek: \(error)")
+                targetConnection.cancel()
+                originalConnection.cancel()
+                return
+            }
+
+            var buffer = accumulated
+            if let data = data, !data.isEmpty {
+                buffer.append(data)
+            }
+
+            let headerEndPattern = Data([13, 10, 13, 10])
+            guard let headerEndRange = buffer.range(of: headerEndPattern) else {
+                if isComplete {
+                    self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: true)
+                } else if buffer.count >= Self.responsesPeekMaxBytes {
+                    self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: false)
+                } else {
+                    self.peekResponsesStream(from: targetConnection, to: originalConnection, accumulated: buffer)
+                }
+                return
+            }
+
+            let bodyData = buffer.subdata(in: headerEndRange.upperBound..<buffer.count)
+            let bodyText = String(data: bodyData, encoding: .utf8) ?? ""
+
+            if Self.responsesSSEHasUsableContent(in: bodyText) {
+                self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: isComplete)
+                return
+            }
+
+            if let earlyError = Self.parseEarlyResponsesSSEError(in: bodyText) {
+                NSLog("[ThinkingProxy] Responses SSE early error \(earlyError.code): \(earlyError.message)")
+                ThinkingProxy.fileLog("RESPONSES EARLY ERROR: \(earlyError.code) \(earlyError.message)")
+                targetConnection.cancel()
+                self.sendJSONError(to: originalConnection,
+                                   statusCode: 400,
+                                   code: earlyError.code,
+                                   message: earlyError.message)
+                return
+            }
+
+            if isComplete || buffer.count >= Self.responsesPeekMaxBytes {
+                self.flushBufferedResponse(buffer, from: targetConnection, to: originalConnection, isComplete: isComplete)
+                return
+            }
+
+            self.peekResponsesStream(from: targetConnection, to: originalConnection, accumulated: buffer)
+        }
+    }
+
+    private func flushBufferedResponse(_ buffer: Data,
+                                       from targetConnection: NWConnection,
+                                       to originalConnection: NWConnection,
+                                       isComplete: Bool) {
+        guard !buffer.isEmpty else {
+            if isComplete {
+                finishStreaming(target: targetConnection, client: originalConnection)
+            } else {
+                streamNextChunk(from: targetConnection, to: originalConnection)
+            }
+            return
+        }
+
+        originalConnection.send(content: buffer, completion: .contentProcessed({ [weak self] sendError in
+            guard let self = self else { return }
+            if let sendError = sendError {
+                NSLog("[ThinkingProxy] Send buffered response error: \(sendError)")
+                targetConnection.cancel()
+                originalConnection.cancel()
+                return
+            }
+            if isComplete {
+                self.finishStreaming(target: targetConnection, client: originalConnection)
+            } else {
+                self.streamNextChunk(from: targetConnection, to: originalConnection)
+            }
+        }))
+    }
+
+    /// True when the SSE body already contains text/tool/reasoning output Droid can use.
+    static func responsesSSEHasUsableContent(in body: String) -> Bool {
+        let markers = [
+            "response.output_item.added",
+            "response.output_text.delta",
+            "response.function_call_arguments.delta",
+            "response.custom_tool_call_input.delta",
+            "response.reasoning_summary_text.delta"
+        ]
+        return markers.contains { body.contains($0) }
+    }
+
+    /// Parses an early Responses SSE `error` event (before usable content).
+    static func parseEarlyResponsesSSEError(in body: String) -> (code: String, message: String)? {
+        var eventName = ""
+        for rawLine in body.components(separatedBy: "\n") {
+            let line = rawLine.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+            if line.hasPrefix("event:") {
+                eventName = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+                continue
+            }
+            if line.hasPrefix("data:") {
+                let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                let isErrorEvent = eventName == "error" || payload.contains("\"type\":\"error\"")
+                if isErrorEvent, let parsed = parseResponsesErrorPayload(payload) {
+                    return parsed
+                }
+                continue
+            }
+            if line.isEmpty {
+                eventName = ""
+            }
+        }
+        return nil
+    }
+
+    private static func parseResponsesErrorPayload(_ payload: String) -> (code: String, message: String)? {
+        guard let data = payload.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let type = object["type"] as? String
+        guard type == nil || type == "error" else { return nil }
+        let message = (object["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !message.isEmpty else { return nil }
+        let code = (object["code"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (code?.isEmpty == false ? code! : "upstream_error", message)
     }
     
     /**
@@ -1018,6 +1179,40 @@ class ThinkingProxy {
         responseData.append(headerData)
         responseData.append(bodyData)
         
+        connection.send(content: responseData, completion: .contentProcessed({ _ in
+            connection.cancel()
+        }))
+    }
+
+    /// OpenAI-shaped JSON error so Droid BYOK surfaces the upstream message.
+    private func sendJSONError(to connection: NWConnection,
+                               statusCode: Int,
+                               code: String,
+                               message: String) {
+        let payload: [String: Any] = [
+            "error": [
+                "message": message,
+                "type": "invalid_request_error",
+                "code": code
+            ]
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload) else {
+            sendError(to: connection, statusCode: statusCode, message: message)
+            return
+        }
+        let reason = statusCode == 400 ? "Bad Request" : "Error"
+        let headers = "HTTP/1.1 \(statusCode) \(reason)\r\n" +
+                     "Content-Type: application/json\r\n" +
+                     "Content-Length: \(bodyData.count)\r\n" +
+                     "Connection: close\r\n" +
+                     "\r\n"
+        guard let headerData = headers.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+        var responseData = Data()
+        responseData.append(headerData)
+        responseData.append(bodyData)
         connection.send(content: responseData, completion: .contentProcessed({ _ in
             connection.cancel()
         }))
